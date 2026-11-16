@@ -1,0 +1,16 @@
+<Project Sdk="Dalamud.CN.NET.Sdk/15.0.0">
+
+  <PropertyGroup>
+    <AssemblyName>vnavmesh-tool</AssemblyName>
+    <RootNamespace>VnavmeshTool</RootNamespace>
+    <Version>1.0.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+</Project>

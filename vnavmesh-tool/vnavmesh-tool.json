@@ -1,0 +1,19 @@
+{
+  "Author": "Noidontwantowork",
+  "Name": "vnavmesh-tool",
+  "InternalName": "vnavmesh-tool",
+  "AssemblyVersion": "1.0.0.0",
+  "Description": "在同一游戏进程中管理国际服版与中国服版 vnavmesh 的加载状态，两版互斥切换，带严格卸载完成检测。",
+  "ApplicableVersion": "any",
+  "RepoUrl": "",
+  "Tags": [
+    "navmesh",
+    "utility"
+  ],
+  "DalamudApiLevel": 15,
+  "LoadRequiredState": 0,
+  "LoadSync": false,
+  "CanUnloadAsync": true,
+  "Punchline": "一键切换国际服 / 中国服版 vnavmesh",
+  "AcceptsFeedback": false
+}
