@@ -81,25 +81,31 @@ internal sealed class MainWindow : Window
 
         ImGui.Separator();
 
-        if (ImGui.CollapsingHeader("环境检查 / 导入版本"))
+        if (ImGui.CollapsingHeader("导入 / 更新 vnavmesh"))
         {
             ImGui.TextWrapped(
-                "同一个 InternalName 在 Dalamud 里只能存在一个「已安装」条目，所以两个版本要以开发插件（dev plugin）的形式共存。"
-                + "点下面的按钮会把 installedPlugins\\vnavmesh 下发现的全部版本复制到本插件目录的 Versions 子目录，并登记为开发插件加载位置；"
-                + "已经存在的版本不会重复复制。");
+                "实际使用的双版本 vnavmesh 将以开发版插件（dev plugin）的形式共存。"
+                + "点击“扫描并导入新版本 vnavmesh”会把当前从线上插件库安装的新版本 vnavmesh 复制到本插件的 Versions 子目录；"
+                + "点击“直接线上更新 vnavmesh”则由本插件自动下载并更新 vnavmesh。");
 
             ImGui.Spacing();
 
             if (busy) ImGui.BeginDisabled();
-            if (ImGui.Button("扫描并导入 vnavmesh 版本", new Vector2(ImGui.GetContentRegionAvail().X, 0f)))
+
+            if (ImGui.Button("扫描并导入新版本 vnavmesh", new Vector2(available, 0f)))
             {
-                this.switcher.RequestImport();
+                this.switcher.RequestSyncFromInstalled();
+            }
+
+            if (ImGui.Button("直接线上更新 vnavmesh", new Vector2(available, 0f)))
+            {
+                this.switcher.RequestOnlineUpdate();
             }
 
             if (busy) ImGui.EndDisabled();
 
             ImGui.Spacing();
-            ImGui.TextWrapped("提示：导入后请再执行一次切换，让插件重新扫描并接管两个版本的开关状态。");
+            ImGui.TextWrapped("导入或更新后建议执行任意一种切换，让插件重新接管 vnavmesh 的开关状态。");
         }
     }
 
@@ -128,21 +134,32 @@ internal sealed class MainWindow : Window
             ImGui.PushStyleColor(ImGuiCol.Text, ErrorColor);
             ImGui.TextUnformatted("未检测到任何 vnavmesh 插件条目。");
             ImGui.PopStyleColor();
+            ImGui.Spacing();
+            ImGui.TextWrapped(
+                "请确认本插件目录下存在 Versions\\Global 与 Versions\\CN；"
+                + "点击任意一种切换会自动把这两个槽位登记为开发插件并重新扫描。");
             return;
         }
 
         foreach (var entry in entries)
         {
-            var color = IsErrorState(entry.StateName) ? ErrorColor
+            var stateText = entry.DllMissing ? "路径失效，已忽略" : DescribeState(entry.StateName);
+            var color = entry.DllMissing ? PendingColor
+                : IsErrorState(entry.StateName) ? ErrorColor
                 : entry.IsLoaded ? LoadedColor
                 : entry.IsBusy ? PendingColor
                 : IdleColor;
 
             ImGui.PushStyleColor(ImGuiCol.Text, color);
             ImGui.TextUnformatted(
-                $"{entry.FlavorName}  {entry.Version}  ({DescribeState(entry.StateName)})"
+                $"{entry.FlavorName}  {entry.Version}  ({stateText})"
                 + (entry.IsDev ? "  [dev]" : string.Empty));
             ImGui.PopStyleColor();
+        }
+
+        if (entries.Any(x => x.DllMissing))
+        {
+            ImGui.TextWrapped("标有“路径失效”的条目来自已改名或删除的旧目录，切换时会自动从开发插件列表中清理。");
         }
 
         ImGui.Spacing();

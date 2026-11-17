@@ -2,8 +2,8 @@
   "Author": "Noidontwantowork",
   "Name": "vnavmesh-tool",
   "InternalName": "vnavmesh-tool",
-  "AssemblyVersion": "1.0.0.0",
-  "Description": "在同一游戏进程中管理国际服版与中国服版 vnavmesh 的加载状态，两版互斥切换，带严格卸载完成检测。",
+  "AssemblyVersion": "1.0.1.1",
+  "Description": "方便快捷地切换原版 vnavmesh 和 vnavmesh CN，带有切换的宏命令，为你的不同插件匹配更合适的 vnavmesh 版本。",
   "ApplicableVersion": "any",
   "RepoUrl": "",
   "Tags": [

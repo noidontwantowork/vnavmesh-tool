@@ -75,11 +75,11 @@ internal sealed class VnavmeshSwitcher : IDisposable
     public void RequestToggle()
     {
         this.Refresh();
-        var list = this.Entries;
+        var list = this.Entries.Where(x => x.IsUsable).ToList();
 
         if (list.Count == 0)
         {
-            this.Fail("没有检测到任何版本的 vnavmesh 插件。");
+            this.Fail("没有检测到任何可用的 vnavmesh 插件条目。请先运行本插件目录下的 RegisterDevPlugins.bat 登记开发插件路径。");
             return;
         }
 
@@ -120,8 +120,8 @@ internal sealed class VnavmeshSwitcher : IDisposable
         _ = Task.Run(() => this.RunSwitchAsync(target, token));
     }
 
-    /// <summary>把 installedPlugins 下的所有 vnavmesh 版本登记为开发插件。</summary>
-    public void RequestImport()
+    /// <summary>③ 把 installedPlugins 里发现的新版本同步进本插件的 Versions 槽位。</summary>
+    public void RequestSyncFromInstalled()
     {
         if (Interlocked.CompareExchange(ref this.busy, 1, 0) != 0)
         {
@@ -133,8 +133,25 @@ internal sealed class VnavmeshSwitcher : IDisposable
         this.cancellation = new CancellationTokenSource();
         var token = this.cancellation.Token;
 
-        this.SetStatus("正在扫描并导入 vnavmesh 版本 …");
-        _ = Task.Run(() => this.RunImportAsync(token));
+        this.SetStatus("正在扫描并导入新版本 vnavmesh …");
+        _ = Task.Run(() => this.RunSyncFromInstalledAsync(token));
+    }
+
+    /// <summary>④ 直接从上游插件库下载并更新两个槽位。</summary>
+    public void RequestOnlineUpdate()
+    {
+        if (Interlocked.CompareExchange(ref this.busy, 1, 0) != 0)
+        {
+            this.Fail("上一次操作还在进行中，请稍候。");
+            return;
+        }
+
+        this.cancellation?.Dispose();
+        this.cancellation = new CancellationTokenSource();
+        var token = this.cancellation.Token;
+
+        this.SetStatus("正在从上游插件库检查 vnavmesh 更新 …");
+        _ = Task.Run(() => this.RunOnlineUpdateAsync(token));
     }
 
     public void Dispose()
@@ -148,9 +165,16 @@ internal sealed class VnavmeshSwitcher : IDisposable
     {
         try
         {
+            var pluginRoot = this.ResolvePluginRoot();
+            if (pluginRoot is null) return;
+
+            // 阶段 -1：自愈开发插件登记。旧版本留下的「Versions\<flavor>-<版本号>」条目会指向已删目录，
+            // 这些条目只能报 did not exist，必须先清掉并把 Global / CN 两个槽位补登记。
+            await this.RepairDevLocationsAsync(pluginRoot, token).ConfigureAwait(false);
+
             // 阶段 0：先让所有条目离开「加载中 / 卸载中」这种过渡状态。
             if (!await this.WaitUntilAsync(
-                    () => this.SnapshotSafe().All(x => !x.IsBusy),
+                    () => Relevant(this.SnapshotSafe()).All(x => !x.IsBusy),
                     StableTimeout,
                     token).ConfigureAwait(false))
             {
@@ -158,22 +182,22 @@ internal sealed class VnavmeshSwitcher : IDisposable
                 return;
             }
 
-            var current = this.SnapshotSafe();
+            var current = Relevant(this.SnapshotSafe());
             if (current.Count == 0)
             {
-                this.Fail("没有检测到任何版本的 vnavmesh 插件。");
+                this.Fail("没有检测到任何可用的 vnavmesh 插件条目。请先运行本插件目录下的 RegisterDevPlugins.bat。");
                 return;
             }
 
             // 同一个分支可能同时存在「已安装」条目和「开发插件」条目：优先用开发插件那份，
             // 避免启动清理流程把 installedPlugins 下的非最高版本目录删掉。
-            var targetEntry = current.Where(x => x.Flavor == target)
+            var targetEntry = current.Where(x => x.Flavor == target && x.IsUsable)
                 .OrderByDescending(x => x.IsDev)
                 .ThenByDescending(x => x.Version)
                 .FirstOrDefault();
             if (targetEntry is null)
             {
-                this.Fail($"当前没有可用的{FlavorLabel(target)} vnavmesh 条目。");
+                this.Fail($"当前没有可用的{FlavorLabel(target)} vnavmesh 条目：Versions 槽位缺失或未登记为开发插件。");
                 return;
             }
 
@@ -205,7 +229,7 @@ internal sealed class VnavmeshSwitcher : IDisposable
             if (!await this.WaitUntilAsync(
                     () =>
                     {
-                        var list = this.SnapshotSafe();
+                        var list = Relevant(this.SnapshotSafe());
                         return list.Count > 0
                                && list.All(x => x.IsFullyClosed)
                                && list.All(x => x.StateName != "UnloadError");
@@ -218,7 +242,7 @@ internal sealed class VnavmeshSwitcher : IDisposable
             }
 
             // 阶段 4：二次确认。任何活动状态都视为失败，绝不冒险进入加载。
-            var closed = this.SnapshotSafe();
+            var closed = Relevant(this.SnapshotSafe());
             if (closed.Count == 0)
             {
                 this.Fail("vnavmesh 条目在关闭后意外消失，已中止。");
@@ -238,7 +262,7 @@ internal sealed class VnavmeshSwitcher : IDisposable
             }
 
             var targetFinal = closed.FirstOrDefault(x => ReferenceEquals(x.Instance, targetEntry.Instance))
-                              ?? closed.Where(x => x.Flavor == target)
+                              ?? closed.Where(x => x.Flavor == target && x.IsUsable)
                                   .OrderByDescending(x => x.IsDev)
                                   .ThenByDescending(x => x.Version)
                                   .FirstOrDefault();
@@ -291,57 +315,18 @@ internal sealed class VnavmeshSwitcher : IDisposable
         }
     }
 
-    private async Task RunImportAsync(CancellationToken token)
+    private async Task RunSyncFromInstalledAsync(CancellationToken token)
     {
         try
         {
-            var versions = VnavmeshImporter.ScanInstalledVersions(this.log);
-            if (versions.Count == 0)
-            {
-                this.Fail("未在已安装插件目录中找到 vnavmesh 版本目录（installedPlugins\\vnavmesh\\<版本>）。");
-                return;
-            }
+            var pluginRoot = this.ResolvePluginRoot();
+            if (pluginRoot is null) return;
 
-            var pluginRoot = Path.GetDirectoryName(this.pluginInterface.AssemblyLocation.FullName);
-            if (string.IsNullOrEmpty(pluginRoot))
-            {
-                this.Fail("无法定位本插件所在目录。");
-                return;
-            }
+            await this.RepairDevLocationsAsync(pluginRoot, token).ConfigureAwait(false);
 
-            var registered = new List<string>();
-            foreach (var version in versions)
-            {
-                token.ThrowIfCancellationRequested();
-
-                var dllPath = await VnavmeshImporter.ImportAsync(version, pluginRoot, this.log, token).ConfigureAwait(false);
-                if (dllPath is null) continue;
-
-                var nickname = $"{version.FlavorName} {version.Version}";
-                if (DalamudInternal.RegisterDevPluginLocation(dllPath, nickname)) registered.Add(nickname);
-            }
-
-            if (registered.Count == 0)
-            {
-                this.Fail("没有新的版本需要导入（目标位置已存在，或已全部登记为开发插件）。");
-                return;
-            }
-
+            var summary = await VnavmeshImporter.SyncFromInstalledAsync(pluginRoot, this.log, token).ConfigureAwait(false);
             DalamudInternal.QueueConfigSave();
-            await DalamudInternal.ScanDevPluginsAsync().ConfigureAwait(false);
-
-            // 新导入的版本一律默认关闭，只保留当前正在运行的那一版。
-            var snapshot = this.SnapshotSafe();
-            var running = snapshot.FirstOrDefault(x => x.IsLoaded);
-            foreach (var entry in snapshot)
-            {
-                var enabled = running is not null && ReferenceEquals(entry.Instance, running.Instance);
-                DalamudInternal.SetStartOnBoot(entry.Instance, enabled);
-                await DalamudInternal.SetProfileWantedAsync(entry.WorkingPluginId, entry.InternalName, enabled).ConfigureAwait(false);
-            }
-
-            DalamudInternal.QueueConfigSave();
-            this.SetStatus($"已导入 {registered.Count} 个版本：{string.Join("、", registered)}。");
+            this.SetStatus($"导入完成：{summary}");
         }
         catch (OperationCanceledException)
         {
@@ -359,11 +344,52 @@ internal sealed class VnavmeshSwitcher : IDisposable
         }
     }
 
+    private async Task RunOnlineUpdateAsync(CancellationToken token)
+    {
+        try
+        {
+            var pluginRoot = this.ResolvePluginRoot();
+            if (pluginRoot is null) return;
+
+            await this.RepairDevLocationsAsync(pluginRoot, token).ConfigureAwait(false);
+
+            var summary = await VnavmeshImporter.UpdateFromRepositoriesAsync(pluginRoot, this.log, token).ConfigureAwait(false);
+            DalamudInternal.QueueConfigSave();
+            this.SetStatus($"线上更新完成：{summary}");
+        }
+        catch (OperationCanceledException)
+        {
+            this.SetStatus("操作已取消。", true);
+        }
+        catch (Exception ex)
+        {
+            this.Fail($"线上更新失败：{ex.Message}");
+            this.log.Error(ex, "线上更新 vnavmesh 失败");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref this.busy, 0);
+            this.Refresh();
+        }
+    }
+
+    private string? ResolvePluginRoot()
+    {
+        var root = Path.GetDirectoryName(this.pluginInterface.AssemblyLocation.FullName);
+        if (string.IsNullOrEmpty(root))
+        {
+            this.Fail("无法定位本插件所在目录。");
+            return null;
+        }
+
+        return root;
+    }
+
     private async Task PersistAsync(VnavmeshEntry chosen, IReadOnlyList<VnavmeshEntry> snapshot)
     {
         try
         {
-            foreach (var entry in snapshot)
+            foreach (var entry in snapshot.Where(x => x.IsUsable))
             {
                 var enabled = ReferenceEquals(entry.Instance, chosen.Instance);
                 DalamudInternal.SetStartOnBoot(entry.Instance, enabled);
@@ -376,6 +402,39 @@ internal sealed class VnavmeshSwitcher : IDisposable
         {
             this.log.Warning(ex, "写入 vnavmesh 开关持久化状态失败");
         }
+    }
+
+    /// <summary>
+    /// 参与冲突判定的条目：路径有效，或仍被加载 / 正在过渡 / 上一次卸载失败。
+    /// 指向已删目录、且从未成功加载的旧条目会被排除——它们既占用不了程序集，也加载不了。
+    /// </summary>
+    private static List<VnavmeshEntry> Relevant(IReadOnlyList<VnavmeshEntry> snapshot) =>
+        snapshot.Where(x => x.IsUsable || x.IsLoaded || x.IsBusy || string.Equals(x.StateName, "UnloadError", StringComparison.Ordinal)).ToList();
+
+    /// <summary>
+    /// 自愈开发插件登记：清掉指向已删目录的旧条目，把 Versions\Global 与 Versions\CN 补登记，
+    /// 再让 Dalamud 重新扫描开发插件，使本次进程内立刻能识别到正确的两个版本。
+    /// </summary>
+    private async Task RepairDevLocationsAsync(string pluginRoot, CancellationToken token)
+    {
+        var versionsRoot = Path.Combine(pluginRoot, VnavmeshImporter.VersionsFolderName);
+        var changed = DalamudInternal.RemoveStaleDevLocations(versionsRoot + Path.DirectorySeparatorChar) > 0;
+
+        foreach (var flavor in new[] { VnavmeshFlavor.Global, VnavmeshFlavor.China })
+        {
+            var dll = Path.Combine(VnavmeshImporter.SlotDirectory(pluginRoot, flavor), "vnavmesh.dll");
+            if (!File.Exists(dll)) continue;
+
+            var nickname = flavor == VnavmeshFlavor.China ? "vnavmesh CN" : "vnavmesh Global";
+            if (DalamudInternal.RegisterDevPluginLocation(dll, nickname)) changed = true;
+        }
+
+        if (!changed) return;
+
+        DalamudInternal.QueueConfigSave();
+        this.SetStatus("正在同步 vnavmesh 的开发插件路径 …");
+        await DalamudInternal.ScanDevPluginsAsync().ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
     }
 
     private async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken token)

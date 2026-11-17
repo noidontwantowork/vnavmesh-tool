@@ -45,12 +45,18 @@ internal sealed class VnavmeshEntry
 
     public required VnavmeshFlavor Flavor { get; init; }
 
+    /// <summary>dll 文件已经不在磁盘上（多见于登记了旧目录、之后目录被改名或删除）。</summary>
+    public required bool DllMissing { get; init; }
+
     public bool IsLoaded => string.Equals(this.StateName, "Loaded", StringComparison.Ordinal);
 
     public bool IsBusy => this.StateName is "Loading" or "Unloading";
 
     /// <summary>真正没有占用程序集的状态：已卸载，或加载失败（同样没有活着的实例）。</summary>
     public bool IsFullyClosed => this.StateName is "Unloaded" or "LoadError" or "DependencyResolutionFailed";
+
+    /// <summary>路径有效（可以真正被加载）的条目；失效条目只剩「已加载时仍需卸载」这一种用途。</summary>
+    public bool IsUsable => !this.DllMissing;
 
     public string FlavorName => this.Flavor == VnavmeshFlavor.China ? "中国服版" : "国际服版";
 }
@@ -71,6 +77,8 @@ internal static class DalamudInternal
     private static Type? configurationType;
     private static Type? devLocationType;
     private static Type? disposalModeType;
+
+    private static readonly Dictionary<string, (long Length, DateTime WriteTime, Version Version)> DiskVersionCache = [];
 
     internal static Type PluginManagerType
     {
@@ -194,6 +202,7 @@ internal static class DalamudInternal
             var version = ReadProp(item, "EffectiveVersion") as Version ?? new Version(0, 0);
             var state = ReadProp(item, "State")?.ToString() ?? "Unknown";
             var dllFile = ReadProp(item, "DllFile") as FileInfo;
+            var dllPath = dllFile?.FullName ?? string.Empty;
             var workingId = ReadProp(item, "EffectiveWorkingPluginId") is Guid guid ? guid : Guid.Empty;
             var isDev = ReadProp(item, "IsDev") is bool dev && dev;
 
@@ -203,16 +212,63 @@ internal static class DalamudInternal
                 Name = name,
                 InternalName = internalName,
                 Author = author,
-                Version = version,
+                Version = ResolveVersion(dllFile?.FullName, version),
                 StateName = state,
-                DllPath = dllFile?.FullName ?? string.Empty,
+                DllPath = dllPath,
                 WorkingPluginId = workingId,
                 IsDev = isDev,
                 Flavor = DetectFlavor(name, author),
+                DllMissing = dllPath.Length == 0 || !File.Exists(dllPath),
             });
         }
 
         return result;
+    }
+
+    /// <summary>优先读磁盘上的 manifest 版本，避免插件更新后界面一直显示缓存的旧版本号。</summary>
+    internal static Version ResolveVersion(string? dllPath, Version fallback)
+    {
+        if (string.IsNullOrEmpty(dllPath)) return fallback;
+
+        var directory = Path.GetDirectoryName(dllPath);
+        if (string.IsNullOrEmpty(directory)) return fallback;
+
+        var manifestPath = Path.Combine(directory, "vnavmesh.json");
+
+        try
+        {
+            var info = new FileInfo(manifestPath);
+            if (!info.Exists) return fallback;
+
+            lock (DiskVersionCache)
+            {
+                if (DiskVersionCache.TryGetValue(manifestPath, out var cached)
+                    && cached.Length == info.Length
+                    && cached.WriteTime == info.LastWriteTimeUtc)
+                {
+                    return cached.Version;
+                }
+            }
+
+            using var document = System.Text.Json.JsonDocument.Parse(File.ReadAllText(manifestPath));
+            var root = document.RootElement;
+            var text = root.TryGetProperty("AssemblyVersion", out var assemblyVersion) ? assemblyVersion.GetString()
+                : root.TryGetProperty("Version", out var versionProperty) ? versionProperty.GetString()
+                : null;
+
+            if (!Version.TryParse(text, out var version)) version = fallback;
+
+            lock (DiskVersionCache)
+            {
+                DiskVersionCache[manifestPath] = (info.Length, info.LastWriteTimeUtc, version);
+            }
+
+            return version;
+        }
+        catch
+        {
+            return fallback;
+        }
     }
 
     internal static async Task LoadAsync(object plugin, TimeSpan timeout, CancellationToken cancellationToken)
@@ -275,7 +331,7 @@ internal static class DalamudInternal
         ConfigurationType.GetMethod("QueueSave", BindingFlags.Public | BindingFlags.Instance)?.Invoke(config, null);
     }
 
-    /// <summary>把一份 dll 路径登记为开发插件加载位置；已登记则跳过。</summary>
+    /// <summary>把一份 dll 路径登记为开发插件加载位置；已登记但被停用的条目会被重新启用。</summary>
     internal static bool RegisterDevPluginLocation(string dllPath, string nickname)
     {
         var config = GetService(ConfigurationType);
@@ -285,8 +341,26 @@ internal static class DalamudInternal
         foreach (var existing in list)
         {
             if (existing is null) continue;
-            if (ReadProp(existing, "Path") is string path && string.Equals(path, dllPath, StringComparison.OrdinalIgnoreCase))
-                return false;
+            if (ReadProp(existing, "Path") is not string path || !string.Equals(path, dllPath, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var enabledProp = DevLocationType.GetProperty("IsEnabled");
+            var nicknameProp = DevLocationType.GetProperty("Nickname");
+            var changed = false;
+
+            if (enabledProp is not null && enabledProp.GetValue(existing) is false)
+            {
+                enabledProp.SetValue(existing, true);
+                changed = true;
+            }
+
+            if (nicknameProp is not null && nicknameProp.GetValue(existing) is null or "")
+            {
+                nicknameProp.SetValue(existing, nickname);
+                changed = true;
+            }
+
+            return changed;
         }
 
         var settings = Activator.CreateInstance(DevLocationType, nonPublic: true)
@@ -297,6 +371,28 @@ internal static class DalamudInternal
         DevLocationType.GetProperty("Nickname")?.SetValue(settings, nickname);
         list.Add(settings);
         return true;
+    }
+
+    /// <summary>移除指向已不存在文件的开发插件加载位置（只处理本插件 Versions 目录下的条目）。</summary>
+    internal static int RemoveStaleDevLocations(string versionsRoot)
+    {
+        var config = GetService(ConfigurationType);
+        if (ConfigurationType.GetProperty("DevPluginLoadLocations", BindingFlags.Public | BindingFlags.Instance)?.GetValue(config) is not IList list)
+            return 0;
+
+        var removed = 0;
+        for (var i = list.Count - 1; i >= 0; i--)
+        {
+            if (list[i] is not { } item) continue;
+            if (ReadProp(item, "Path") is not string path) continue;
+            if (!path.StartsWith(versionsRoot, StringComparison.OrdinalIgnoreCase)) continue;
+            if (File.Exists(path)) continue;
+
+            list.RemoveAt(i);
+            removed++;
+        }
+
+        return removed;
     }
 
     internal static async Task ScanDevPluginsAsync()
