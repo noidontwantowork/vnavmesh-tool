@@ -2,8 +2,8 @@
   "Author": "Noidontwantowork",
   "Name": "vnavmesh-tool",
   "InternalName": "vnavmesh-tool",
-  "AssemblyVersion": "1.0.1.1",
-  "Description": "方便快捷地切换原版 vnavmesh 和 vnavmesh CN，带有切换的宏命令，为你的不同插件匹配更合适的 vnavmesh 版本。",
+  "AssemblyVersion": "1.0.3.0",
+  "Description": "方便快捷地切换原版 vnavmesh 和 vnavmesh CN，带有切换的宏命令，为你的不同插件匹配更合适的 vnavmesh 版本，同时避免切换时重建地图缓存。",
   "ApplicableVersion": "any",
   "RepoUrl": "",
   "Tags": [

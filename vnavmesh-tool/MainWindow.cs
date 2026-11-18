@@ -107,6 +107,25 @@ internal sealed class MainWindow : Window
             ImGui.Spacing();
             ImGui.TextWrapped("导入或更新后建议执行任意一种切换，让插件重新接管 vnavmesh 的开关状态。");
         }
+
+        ImGui.Separator();
+
+        if (ImGui.CollapsingHeader("双版本配置共存（减少重建缓存频率）"))
+        {
+            ImGui.TextWrapped("开启本功能将额外占用一定硬盘空间，请确保你的 XIVLauncher 所在的硬盘分区空间充足。");
+
+            ImGui.Spacing();
+
+            var isolation = this.switcher.ProfileIsolationEnabled;
+            if (ImGui.Checkbox("自动调整 vnavmesh 配置与缓存", ref isolation))
+            {
+                this.switcher.SetProfileIsolation(isolation);
+            }
+
+            ImGui.TextWrapped(
+                "配置存储位置：pluginConfigs\\vnavmesh-tool-store\\Global 与 \\CN。"
+                + "首次切换会智能识别现有配置文件；此后每个版本各自保留自己的 meshcache / worker。");
+        }
     }
 
     private static string DescribeState(string state) => state switch
@@ -184,5 +203,9 @@ internal sealed class MainWindow : Window
         }
 
         ImGui.TextWrapped(summary);
+
+        ImGui.PushStyleColor(ImGuiCol.Text, IdleColor);
+        ImGui.TextWrapped(this.switcher.ProfileSummary);
+        ImGui.PopStyleColor();
     }
 }

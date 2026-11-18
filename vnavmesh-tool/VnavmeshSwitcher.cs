@@ -23,19 +23,23 @@ internal sealed class VnavmeshSwitcher : IDisposable
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IPluginLog log;
+    private readonly VnavmeshToolConfig config;
     private readonly object gate = new();
 
     private IReadOnlyList<VnavmeshEntry> entries = [];
     private DateTime lastRefreshUtc = DateTime.MinValue;
+    private DateTime lastProfileProbeUtc = DateTime.MinValue;
     private int busy;
     private string statusText = "就绪。";
+    private string profileSummary = "配置共存：检测中 …";
     private bool statusIsError;
     private CancellationTokenSource? cancellation;
 
-    public VnavmeshSwitcher(IDalamudPluginInterface pluginInterface, IPluginLog log)
+    public VnavmeshSwitcher(IDalamudPluginInterface pluginInterface, IPluginLog log, VnavmeshToolConfig config)
     {
         this.pluginInterface = pluginInterface;
         this.log = log;
+        this.config = config;
     }
 
     public IReadOnlyList<VnavmeshEntry> Entries => Volatile.Read(ref this.entries);
@@ -45,6 +49,25 @@ internal sealed class VnavmeshSwitcher : IDisposable
     public string StatusText => Volatile.Read(ref this.statusText);
 
     public bool StatusIsError => Volatile.Read(ref this.statusIsError);
+
+    /// <summary>配置目录隔离（换位）是否启用。</summary>
+    public bool ProfileIsolationEnabled
+    {
+        get => this.config.ProfileIsolationEnabled;
+        set => this.config.ProfileIsolationEnabled = value;
+    }
+
+    /// <summary>活动配置位的当前归属，用于窗口展示。</summary>
+    public string ProfileSummary => Volatile.Read(ref this.profileSummary);
+
+    public void SetProfileIsolation(bool enabled)
+    {
+        if (this.config.ProfileIsolationEnabled == enabled) return;
+
+        this.config.ProfileIsolationEnabled = enabled;
+        this.SaveConfig();
+        this.ProbeProfile(force: true);
+    }
 
     public static string FlavorLabel(VnavmeshFlavor flavor) => flavor == VnavmeshFlavor.China ? "中国服版" : "国际服版";
 
@@ -64,6 +87,8 @@ internal sealed class VnavmeshSwitcher : IDisposable
             {
                 this.entries = DalamudInternal.Snapshot();
             }
+
+            this.ProbeProfile();
         }
         catch (Exception ex)
         {
@@ -168,6 +193,8 @@ internal sealed class VnavmeshSwitcher : IDisposable
             var pluginRoot = this.ResolvePluginRoot();
             if (pluginRoot is null) return;
 
+            var configsRoot = this.config.ProfileIsolationEnabled ? this.ResolvePluginConfigsRoot() : null;
+
             // 阶段 -1：自愈开发插件登记。旧版本留下的「Versions\<flavor>-<版本号>」条目会指向已删目录，
             // 这些条目只能报 did not exist，必须先清掉并把 Global / CN 两个槽位补登记。
             await this.RepairDevLocationsAsync(pluginRoot, token).ConfigureAwait(false);
@@ -201,9 +228,12 @@ internal sealed class VnavmeshSwitcher : IDisposable
                 return;
             }
 
-            // 阶段 1：目标版本已经是唯一在跑的版本，直接收尾。
+            // 阶段 1：目标版本已经是唯一在跑的版本，且配置位也对得上，直接收尾。
             var loadedNow = current.Where(x => x.IsLoaded).ToList();
-            if (loadedNow.Count == 1 && ReferenceEquals(loadedNow[0].Instance, targetEntry.Instance))
+            var previousFlavor = loadedNow.Count == 1 ? loadedNow[0].Flavor : (VnavmeshFlavor?)null;
+            if (loadedNow.Count == 1
+                && ReferenceEquals(loadedNow[0].Instance, targetEntry.Instance)
+                && !this.IsProfileMismatched(configsRoot, target))
             {
                 await this.PersistAsync(targetEntry, current).ConfigureAwait(false);
                 this.SetStatus($"{FlavorLabel(target)} {targetEntry.Version} 已在运行，无需切换。");
@@ -271,6 +301,43 @@ internal sealed class VnavmeshSwitcher : IDisposable
             {
                 this.Fail($"关闭后找不到{FlavorLabel(target)}条目，已中止加载。");
                 return;
+            }
+
+            // 阶段 4.5：交换两版的配置目录。这时所有 vnavmesh 都已真正卸载完成，
+            // 活动目录没有任何句柄，rename 是纯元数据操作（O(1)），不复制数据。
+            if (configsRoot is not null)
+            {
+                try
+                {
+                    await VnavmeshProfileStore
+                        .RecoverIfNeededAsync(configsRoot, this.log, token)
+                        .ConfigureAwait(false);
+
+                    // 首次归属：把用户现有的那套共享配置智能拆分到 Global / CN 两个槽位。
+                    // 没装过 vnavmesh 时这里只会登记归属，两个槽位保持空目录。
+                    await VnavmeshProfileStore
+                        .MigrateIfNeededAsync(configsRoot, this.log, token)
+                        .ConfigureAwait(false);
+
+                    var from = this.ResolveActiveFlavor(configsRoot, previousFlavor);
+                    if (from != target)
+                    {
+                        this.SetStatus($"正在换位{FlavorLabel(from)}与{FlavorLabel(target)}的配置文件 …");
+                    }
+
+                    await VnavmeshProfileStore
+                        .SwapAsync(configsRoot, from, target, this.log, token)
+                        .ConfigureAwait(false);
+
+                    this.config.LastActiveFlavor = target;
+                    this.SaveConfig();
+                }
+                catch (Exception ex)
+                {
+                    this.Fail($"切换配置文件失败，已中止加载：{ex.Message}");
+                    this.log.Error(ex, "vnavmesh 配置目录换位失败");
+                    return;
+                }
             }
 
             // 阶段 5：加载目标版本。
@@ -383,6 +450,100 @@ internal sealed class VnavmeshSwitcher : IDisposable
         }
 
         return root;
+    }
+
+    /// <summary>取 <c>pluginConfigs</c> 根目录（本插件配置目录的父目录）。</summary>
+    private string? ResolvePluginConfigsRoot()
+    {
+        try
+        {
+            var own = this.pluginInterface.GetPluginConfigDirectory();
+            var root = VnavmeshProfileStore.PluginConfigsRoot(own);
+            if (root is null) this.log.Warning("无法从插件配置目录推导 pluginConfigs 根目录，本次跳过配置共存。");
+
+            return root;
+        }
+        catch (Exception ex)
+        {
+            this.log.Warning(ex, "读取插件配置目录失败，本次跳过配置共存。");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 判定活动配置位当前归属哪个版本。
+    /// 首次切换时会把现有配置智能拆分（worker → CN，其余 → Global），之后以「上次换位写下的归属标记 → 换位前正在运行的版本 → 上次记录」为准。
+    /// 归属标记优先：用户手动用 /xlplugins 换过版本时，活动目录里的配置并没有跟着换，只有标记能说明它是谁的。
+    /// </summary>
+    private VnavmeshFlavor ResolveActiveFlavor(string configsRoot, VnavmeshFlavor? previousFlavor)
+    {
+        if (!VnavmeshProfileStore.IsMigrated(configsRoot)) return VnavmeshFlavor.Global;
+
+        return VnavmeshProfileStore.ReadActiveOwner(configsRoot)
+               ?? previousFlavor
+               ?? this.config.LastActiveFlavor
+               ?? VnavmeshFlavor.Global;
+    }
+
+    /// <summary>
+    /// 目标版本的配置位是否与当前活动配置位对不上。
+    /// 对不上时即使目标版本已经在运行，也要走完整流程把配置换回来，否则它读到的还是另一版的缓存。
+    /// </summary>
+    private bool IsProfileMismatched(string? configsRoot, VnavmeshFlavor target)
+    {
+        if (configsRoot is null) return false;
+        if (!VnavmeshProfileStore.IsMigrated(configsRoot)) return false;
+
+        var owner = VnavmeshProfileStore.ReadActiveOwner(configsRoot) ?? this.config.LastActiveFlavor;
+        return owner is not null && owner.Value != target;
+    }
+
+    private void SaveConfig()
+    {
+        try
+        {
+            this.pluginInterface.SavePluginConfig(this.config);
+        }
+        catch (Exception ex)
+        {
+            this.log.Warning(ex, "保存 vnavmesh-tool 配置失败");
+        }
+    }
+
+    private void ProbeProfile(bool force = false)
+    {
+        if (!force && DateTime.UtcNow - this.lastProfileProbeUtc < TimeSpan.FromSeconds(1)) return;
+        this.lastProfileProbeUtc = DateTime.UtcNow;
+
+        try
+        {
+            Volatile.Write(ref this.profileSummary, this.DescribeProfile());
+        }
+        catch (Exception ex)
+        {
+            this.log.Debug(ex, "读取配置共存状态失败。");
+        }
+    }
+
+    private string DescribeProfile()
+    {
+        if (!this.config.ProfileIsolationEnabled) return "配置共存：已关闭，两版共用同一套配置文件。";
+
+        var root = this.ResolvePluginConfigsRoot();
+        if (root is null) return "配置共存：无法定位 pluginConfigs 目录。";
+
+        if (!VnavmeshProfileStore.IsMigrated(root)) return "配置共存：尚未归属，首次切换会智能拆分现有配置。";
+
+        var owner = VnavmeshProfileStore.ReadActiveOwner(root) ?? this.config.LastActiveFlavor;
+        var ownerText = owner is null ? "未知" : FlavorLabel(owner.Value);
+
+        var loaded = this.Entries.FirstOrDefault(x => x.IsLoaded && x.IsUsable);
+        if (owner is not null && loaded is not null && loaded.Flavor != owner.Value)
+        {
+            return $"配置共存：活动配置位 {ownerText}，当前加载 {FlavorLabel(loaded.Flavor)}（不匹配，点任意切换修复）。";
+        }
+
+        return $"配置共存：活动配置位 {ownerText}。";
     }
 
     private async Task PersistAsync(VnavmeshEntry chosen, IReadOnlyList<VnavmeshEntry> snapshot)

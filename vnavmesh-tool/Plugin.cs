@@ -1,3 +1,6 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
@@ -14,7 +17,9 @@ public sealed class Plugin : IDalamudPlugin
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commandManager;
+    private readonly IPluginLog log;
     private readonly WindowSystem windowSystem = new("vnavmesh-tool");
+    private readonly VnavmeshToolConfig config;
     private readonly VnavmeshSwitcher switcher;
     private readonly MainWindow mainWindow;
 
@@ -22,8 +27,11 @@ public sealed class Plugin : IDalamudPlugin
     {
         this.pluginInterface = pluginInterface;
         this.commandManager = commandManager;
+        this.log = log;
 
-        this.switcher = new VnavmeshSwitcher(pluginInterface, log);
+        this.config = pluginInterface.GetPluginConfig() as VnavmeshToolConfig ?? new VnavmeshToolConfig();
+
+        this.switcher = new VnavmeshSwitcher(pluginInterface, log, this.config);
         this.mainWindow = new MainWindow(this.switcher);
 
         this.windowSystem.AddWindow(this.mainWindow);
@@ -50,6 +58,8 @@ public sealed class Plugin : IDalamudPlugin
         {
             HelpMessage = "打开 vnavmesh-tool 窗口。",
         });
+
+        _ = Task.Run(this.RecoverProfileStoreAsync);
     }
 
     public void Dispose()
@@ -64,7 +74,33 @@ public sealed class Plugin : IDalamudPlugin
 
         this.windowSystem.RemoveAllWindows();
         this.switcher.Dispose();
+
+        try
+        {
+            this.pluginInterface.SavePluginConfig(this.config);
+        }
+        catch (Exception ex)
+        {
+            this.log.Warning(ex, "保存 vnavmesh-tool 配置失败");
+        }
     }
 
     private void ToggleMainWindow() => this.mainWindow.Toggle();
+
+    /// <summary>上次切换如果死在两次 rename 之间，这里把它补完或回滚。</summary>
+    private async Task RecoverProfileStoreAsync()
+    {
+        try
+        {
+            var own = this.pluginInterface.GetPluginConfigDirectory();
+            var root = VnavmeshProfileStore.PluginConfigsRoot(own);
+            if (root is null) return;
+
+            await VnavmeshProfileStore.RecoverIfNeededAsync(root, this.log, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            this.log.Warning(ex, "vnavmesh 配置目录事务恢复失败");
+        }
+    }
 }

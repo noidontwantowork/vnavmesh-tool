@@ -89,6 +89,37 @@ Dev/
 
 这样重启游戏时不会出现两个版本同时被自动加载的情况。注意 `installedPlugins\vnavmesh` 里那份也会被一并写成禁用——它和开发插件里那份是同一版本，重复启用没有意义，也最容易撞车。
 
+## 双版本配置共存
+
+两版 vnavmesh 的配置目录是**同一个** `%APPDATA%\XIVLauncherCN\pluginConfigs\vnavmesh`（路径由 `InternalName` 拼出，两版 InternalName 相同）。共用会让它们互相覆盖 `meshcache` / `worker` / `customization-editor`，于是每次切换后都要重建缓存——这套缓存实测 208 个文件、949 MB（`worker` 165 个 `.raw.navmesh` 占 894 MB，`meshcache` 39 个 `.navmesh` 占 55 MB）。
+
+本工具的做法是**目录换位**，不是备份还原：
+
+```
+pluginConfigs\
+├── vnavmesh\                     ← 活动位（当前加载的版本在用，路径恒定）
+├── vnavmesh.json                 ← 活动位（插件 JSON 配置，路径恒定）
+└── vnavmesh-tool-store\
+    ├── .active                   ← 活动位归属（Global / CN）
+    ├── .pending                  ← 换位事务日志（只在切换瞬间存在）
+    ├── Global\
+    │   ├── vnavmesh\             ← 国际服版整套配置
+    │   └── vnavmesh.json
+    └── CN\
+        ├── vnavmesh\             ← 中国服版整套配置
+        └── vnavmesh.json
+```
+
+切换时在两个时刻之间插入两步 `Directory.Move`：先把活动位搬回它自己的槽位，再把目标槽位搬到活动位。rename 是 NTFS 元数据操作，**不复制任何字节**，949 MB 的目录也是毫秒级；失败会直接中止加载并回滚，不会出现「拷到一半」的配置。
+
+前提与细节：
+
+- 只在「所有版本都真正卸载完成」之后才换位；换位前还会等 `vnavmesh.Worker.exe` 退出（中国服版的外置构建进程，卸载时是异步终止的）。
+- 每次启动与每次操作前都会检查 `.pending`：上次如果死在两步 rename 之间，会自动补完或回滚，并保证活动位一定存在。
+- **首次切换**会智能拆分现有配置：`worker` 子目录只可能由中国服版产生（国际服版源码里没有 worker 概念），归给 `CN`；其余内容（`meshcache`、`customization-editor` 等）归给 `Global`；`vnavmesh.json` 只有几百字节，两版各留一份副本，谁也不会丢设置。从来没装过 vnavmesh 的用户两个槽位保持空目录，两版各自从空缓存开始生成。
+- 因此这个功能会额外占用硬盘空间（两套缓存各占一份），请确保 XIVLauncher 所在的分区空间充足。
+- 在窗口的「双版本配置共存（减少重建缓存频率）」折叠区可以关掉这个功能；关掉后行为与 1.0.1.x 一致，两版继续共用同一套配置。
+
 ## 导入 / 更新
 
 窗口底部「导入 / 更新 vnavmesh」折叠区有两个按钮：
@@ -114,3 +145,5 @@ Dev/
 - 切换过程不做超时后的「强行加载」兜底：卸载 150 s 内没关干净就报错中止。宁可你手动点第二次，也不冒同名冲突的风险。
 - 两个版本的实际寻路算法差异来自 vnavmesh 自身（国际服版为进程内 DLL 实现，中国服版带 `vnavmesh.Worker.exe` 子进程），本工具只负责让它们互斥地加载。
 - 线上更新依赖上游库的 `DownloadLinkInstall` 字段；上游若改字段名或仓库地址，更新按钮会报错并保留原槽位内容不动。
+- 绕过本工具、直接用 `/xlplugins` 开关 vnavmesh 时，活动配置位不会跟着换：窗口会显示「活动配置位 X，当前加载 Y（不匹配）」，点任意一种切换即可修复。不自动改名是因为正在运行的插件还持有目录句柄。
+- 换位失败（例如资源管理器正停在 `pluginConfigs` 里、杀毒软件短暂占用、`vnavmesh.Worker.exe` 没退干净）会中止本次加载并给出原因；关掉占用窗口后再点一次即可，数据不会丢。

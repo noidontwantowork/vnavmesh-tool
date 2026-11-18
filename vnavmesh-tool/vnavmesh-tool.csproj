@@ -3,9 +3,9 @@
   <PropertyGroup>
     <AssemblyName>vnavmesh-tool</AssemblyName>
     <RootNamespace>VnavmeshTool</RootNamespace>
-    <Version>1.0.1.1</Version>
-    <FileVersion>1.0.1.1</FileVersion>
-    <AssemblyVersion>1.0.1.1</AssemblyVersion>
+    <Version>1.0.3.0</Version>
+    <FileVersion>1.0.3.0</FileVersion>
+    <AssemblyVersion>1.0.3.0</AssemblyVersion>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>

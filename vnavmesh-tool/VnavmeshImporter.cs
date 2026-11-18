@@ -48,7 +48,7 @@ internal sealed class VnavmeshPackage
 /// </summary>
 internal static class VnavmeshImporter
 {
-    private const string UserAgent = "vnavmesh-tool/1.0.1.1";
+    private const string UserAgent = "vnavmesh-tool/1.0.3.0";
 
     internal const string VersionsFolderName = "Versions";
     internal const string GlobalFolderName = "Global";
